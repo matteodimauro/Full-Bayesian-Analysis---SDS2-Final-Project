@@ -1,0 +1,1575 @@
+---
+title: "Final Project SDS2"
+author: "Matteo Di Mauro, 1954323"
+output: html_document
+---
+
+## Final Project - SDS2
+
+### Prediction price of houses in Melbourne
+
+####  Illustation of the dataset
+
+For this Full Bayesian Analysis we will use a dataset that collects *The selling price of the houses in Melbourne*. We consider the price in Australian Dollars: **AUD**.
+
+Our goal is to particularize the price of the houses in this city, by our data. 
+
+The dataset about Melbourne is provided by Kaggle: https://www.kaggle.com/datasets/anthonypino/melbourne-housing-market?resource=download. 
+
+
+```{r include=FALSE }
+#knitr::opts_chunk$set(cache = T)
+options(scipen = 999)
+set.seed(1234)
+library(wesanderson)
+#library(caret)
+library(ggpointdensity)
+library(R2jags)
+library(dplyr)
+library(LaplacesDemon)
+library(cowplot)
+library(gridExtra)
+library(mcmc)
+library(coda)
+library(ggplot2)
+library(Hmisc)
+library(caret)
+library(kableExtra)
+library(corrplot)
+library(Metrics)
+library(tidyverse)
+```
+
+
+Hence we can explore a bit our dataset, and we can extract the following infos:
+
+#### Loading and showing the data
+```{r} 
+case = read.csv('Melbourne_housing_FULL.csv', header = TRUE, sep = ",")
+colnames(case) 
+```
+We have 21 columns
+```{r} 
+case[1:3,]
+```
+And above we can see how our data are made.
+
+Here we have the details about all data: 
+
+
+* *Suburb*: The area where people live
+* *Address*: The address
+* *Room*s: The Number of rooms
+* *Price*: The Price in Australian dollars
+* *Method*: The method of acquisition of the house
+* *Type*: The kind of property bought (Like just bedroom, entire house, etc.)
+* *SellerG*: The Real Estate Agent
+* *Date*: Date sold
+* *Distance*: Distance from Central Business District in Kilometers
+* *Postcode*: Self explanatory
+* *Bedroom2*: Scraped # of Bedrooms (from different source)
+* *Bathroom*: Number of Bathrooms
+* *Car*: Number of car spots
+* *Landsize*: Land Size in Meters
+* *BuildingArea*: Building Size in Meters
+* *YearBuilt*: Year the house was built
+* *CouncilArea*: Governing council for the area
+* *Lattitude*: Self explanatory
+* *Longtitude*: Self explanatory
+* *Regionname*: General Region (West, North West, North, North east …etc)
+* *Propertycoun*t: Number of properties that exist in the suburb.
+```{r echo=FALSE}
+houses = subset(case, select = -c(Address, Method, SellerG, Date, Postcode, Bedroom2, YearBuilt, CouncilArea, Lattitude, Longtitude, Propertycount))
+```
+
+
+#### Exploratory Data Analysis
+
+Some of our data in this step, needs to be filled because there are some n/a values.
+
+To do so, because of the fact that we want to predict prices, we cut-off missing data from the price column, and we input missing values for numerical features with median to avoid outliers influence
+```{r echo=FALSE}
+# Remove rows with NA values in the response variable 
+houses <- houses[!is.na(houses$Price),]
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Convert variables to the proper format type
+houses$Distance = as.numeric(as.character(houses$Distance))
+```
+
+
+
+```{r echo=FALSE}
+houses[is.na(houses[,'Landsize']), 'Landsize'] <- median(houses[,'Landsize'], na.rm = T)
+houses[is.na(houses[,'BuildingArea']), 'BuildingArea'] <- median(houses[,'BuildingArea'], na.rm = T)
+houses[is.na(houses[,'Car']), 'Car'] <- median(houses[,'Car'], na.rm = T)
+houses[is.na(houses[,'Distance']), 'Distance'] <- median(houses[,'Distance'], na.rm = T)
+houses[is.na(houses[,'Bathroom']), 'Bathroom'] <- median(houses[,'Bathroom'], na.rm = T)
+```
+
+```{r echo=FALSE}
+print_utility = houses[complete.cases(houses),]
+
+univariate <- psych::describe(print_utility)
+univariate$mean = round(univariate$mean,2)
+univariate$CoV <- univariate$sd / univariate$mean
+univariate$completeness <- round(univariate$n / dim(print_utility)[1],2) *100
+univariate = as.data.frame(univariate)
+keep = c("n","mean","sd","median","min","max","skew","kurtosis","CoV","completeness")
+univariate = univariate[,keep]
+kable(univariate) %>% 
+  kable_styling()
+```
+
+Here we see a descriptive table where we take in consideration the *mean* for all the features we are interested in, with also the *standard deviation*, the *skewness*, the *kurtosis* and the *covariance*. The features names followed by '*' should be considered not too strongly, that's what suggests the library psych.
+
+After that, we can clearly notice that, for *skewness*, if the number is *greater than $+1$* or *lower than $–1$*, this is an indication of a substantially *skewed distribution* (one tail is longer than another, there is no symmetry). For *kurtosis*,  if the number is *greater than $+1$*, the distribution is too *peaked* (a very narrow distribution with most of the responses in the center).
+
+Hence, we can expect a skewed and peaked distribution from the features about *Type*, *Price*, *Distance*, *Bathroom*, *Car*, *Landsize* and *BuildingArea*.
+
+```{r echo=FALSE}
+#### Detect outliers for numerical variables
+
+one <- ggplot(data = houses, aes(x = "", y = Rooms)) + 
+  geom_boxplot()
+
+two <- ggplot(data = houses, aes(x = "", y = Distance)) + 
+  geom_boxplot()
+
+three <- ggplot(data = houses, aes(x = "", y = Bathroom)) + 
+  geom_boxplot()
+
+four <- ggplot(data = houses, aes(x = "", y = Car)) + 
+  geom_boxplot()
+
+five <- ggplot(data = houses, aes(x = "", y = Landsize)) + 
+  geom_boxplot()
+
+six <- ggplot(data = houses, aes(x = "", y = BuildingArea)) + 
+  geom_boxplot()
+
+grid.arrange(one, two, three, four, five, six, ncol=2)
+```
+
+We also take a look about the outliers in our data, using these box plots, and it is clear that we have to fix that. We will Cap and Floor variables at 95th and 5th percentiles to remove ouliers, before taking a look on some depictions of our data.
+
+```{r echo=FALSE}
+## Cap and floor variables at 95th and 5th percentiles to remove ouliers
+##### CAP variables at 95th and 5th percentiles
+houses$Rooms <- ifelse(houses$Rooms>=quantile(houses$Rooms,0.95),quantile(houses$Rooms,0.95),
+                                ifelse(houses$Rooms<=quantile(houses$Rooms,0.05),quantile(houses$Rooms,0.05),
+                                       houses$Rooms))
+
+houses$Distance <- ifelse(houses$Distance>=quantile(houses$Distance,0.95),quantile(houses$Distance,0.95),
+                                    ifelse(houses$Distance<=quantile(houses$Distance,0.05),quantile(houses$Distance,0.05),
+                                           houses$Distance))
+
+houses$Bathroom <- ifelse(houses$Bathroom>=quantile(houses$Bathroom,0.95),quantile(houses$Bathroom,0.95),
+                             ifelse(houses$Bathroom<=quantile(houses$Bathroom,0.05),quantile(houses$Bathroom,0.05),
+                                    houses$Bathroom))
+
+houses$Car <- ifelse(houses$Car>=quantile(houses$Car,0.95),quantile(houses$Car,0.95),
+                                  ifelse(houses$Car<=quantile(houses$Car,0.05),quantile(houses$Car,0.05),
+                                         houses$Car))
+
+houses$Landsize <- ifelse(houses$Landsize>=quantile(houses$Landsize,0.95),quantile(houses$Landsize,0.95),
+                                     ifelse(houses$Landsize<=quantile(houses$Landsize,0.05),quantile(houses$Landsize,0.05),
+                                            houses$Landsize))
+
+houses$BuildingArea <- ifelse(houses$BuildingArea>=quantile(houses$BuildingArea,0.95),quantile(houses$BuildingArea,0.95),
+                               ifelse(houses$BuildingArea<=quantile(houses$BuildingArea,0.05),quantile(houses$BuildingArea,0.05),
+                                      houses$BuildingArea))
+
+houses$Price <- ifelse(houses$Price>=quantile(houses$Price,0.95),quantile(houses$Price,0.95),
+                              ifelse(houses$Price<=quantile(houses$Price,0.05),quantile(houses$Price,0.05),
+                                     houses$Price))
+
+#summary(houses)
+#dim(houses)
+```
+
+##### Description of relevant data
+
+The first thing we should look is how the response variable is disrtibuted. 
+
+```{r histogram-price, echo=FALSE, message=FALSE, warning=FALSE}
+norm <- ggplot(print_utility, aes(x=Price, color= Price))+
+  geom_histogram(color="orange", fill="yellow")+
+  labs(title="Histogram of price",x="Price")
+
+
+#l_og <- ggplot(print_utility, aes(x=scale(Price), color= scale(Price)))+
+  #geom_histogram(color="blue", fill="cyan")+
+  #labs(title="Scaled histogram of the price",x="Price")
+
+
+#grid.arrange(norm, l_og)
+norm
+```
+
+We begin taking a look at the histogram of our *Price* feature, the target of our prediction. First thing we notice here, is that our data is right-skewed (or positive skewed), as  looking at the table above. It is common a positive skewness, because variables that must be positive, such as distances, sizes, and times, are usually right-skewed. In our case, we are talking about prices. 
+
+We also take a look on how our data are distributed. For numerical data we will use *scatterplots*, while for categorical data we will use *boxplots*.
+
+```{r echo=FALSE}
+subur <- ggplot(print_utility[1:200,], aes(x=Price, y=Suburb, fill=Suburb)) +
+  geom_boxplot(outlier.colour="black", outlier.shape=16,
+             outlier.size=2, notch=FALSE)+
+  labs(title="Suburbs",x="Price", y = "Suburb")+
+  scale_fill_manual(values=c("purple","lightgreen", "lightblue", "orange", "darkgreen"), name = "Name")+
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE))
+
+room_s <- ggplot(print_utility, aes(x=Price, y=log(Rooms), color=log(Rooms),na.rm = TRUE)) +
+  geom_point(na.rm = TRUE, position = "jitter", alpha=0.3)+
+  labs(title="Rooms in relation to price",x="Price", y = "Rooms")+
+  scale_x_continuous(guide = guide_axis(check.overlap = TRUE))+
+  scale_y_continuous(guide = guide_axis(check.overlap = TRUE))
+
+grid.arrange(subur,room_s)
+
+```
+
+First plot is a *box plot*, which shows us five boxes, for the Suburb feature. What we clearly understand is that each of the showed suburb have a different median and a different shape. All boxes have different dimensions and we see some outlier. Also we see that prices have increased when the houses where located in Albert Park and Alphington suburbs. The cheapest suburb we can see here is Airport West.
+
+We can see in the second plot, the *scatter plot*, there is a correlation pattern. We see that it is influenced by outliers, and we also can see that the correlation we have here it's not linear. We add the Jitter due to the discrete nature of the Rooms variable.
+```{r echo=FALSE}
+ty_pe <- ggplot(print_utility[1:300,], aes(x=Price, y=Type, fill=Type,na.rm = TRUE)) +
+  geom_boxplot(outlier.colour="black", outlier.shape=16,
+             outlier.size=2, notch=FALSE)+
+  labs(title="House type by price",x="Price", y = "Type")+
+  scale_fill_manual(values=c("purple", "lightgreen", "lightblue"), labels=c("H: House", "T: Townhouse", "U: Unit"), name = "Type of house")+
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE))
+
+dstnc <- ggplot(print_utility, aes(x=Price, y=log(Distance), color=log(Distance),na.rm = TRUE)) +
+ geom_point(na.rm = TRUE, position = "jitter", alpha=0.3)+
+  labs(title="Central Business District",x="Price", y = "CBD distance")+
+  scale_x_continuous(guide = guide_axis(check.overlap = TRUE))+
+  scale_y_continuous(guide = guide_axis(check.overlap = TRUE))
+
+grid.arrange(ty_pe,dstnc)
+
+```
+
+
+We see another couple made by box plot and scatter plot. The behavior is similar as before. We notice that in box plot we have the type h box that takes the widest range of prices, and we can see, in black, that we have some outliers. Also here different medians. 
+
+Scatter plot tells us that there is a correlation between price and Central Business District Distance, even if the relation also here it's not linear, with the influence of some outliers. Highest distances does not necessarily correspond to highest prices.
+
+```{r echo=FALSE}
+
+btroom <- ggplot(print_utility, aes(x=Price, y=log(Bathroom), color=log(Bathroom),na.rm = TRUE)) +
+  geom_point(na.rm = TRUE, position = "jitter", alpha=0.3)+
+  labs(title="Bathrooms in relation to price",x="Price", y = "Bathrooms")+
+  scale_x_continuous(guide = guide_axis(check.overlap = TRUE))+
+  scale_y_continuous(guide = guide_axis(check.overlap = TRUE))
+
+crnmbr <- ggplot(print_utility, aes(x=Price, y=log(Car), color=log(Car),na.rm = TRUE)) +
+  geom_point(na.rm = TRUE, position = "jitter", alpha=0.3)+
+  labs(title="Car spot in relation to price",x="Price", y = "Car")+
+  scale_x_continuous(guide = guide_axis(check.overlap = TRUE))+
+  scale_y_continuous(guide = guide_axis(check.overlap = TRUE))
+
+grid.arrange(btroom,crnmbr)
+
+```
+
+The two scatter plots can show an already seen situation. There is a concentration of number of bathrooms, and number of car spots, pretty in the same price range of the houses. Both plots are influenced by outliers.
+
+```{r echo=FALSE}
+
+lndsz <- ggplot(print_utility, aes(x=Price, y=log(Landsize), color=log(Landsize),na.rm = TRUE)) +
+  geom_point(na.rm = TRUE, position = "jitter", alpha=0.3)+
+  labs(title="Land size in relation to price",x="Price", y = "Land size")+
+  scale_x_continuous(guide = guide_axis(check.overlap = TRUE))+
+  scale_y_continuous(guide = guide_axis(check.overlap = TRUE))
+
+bldngarea <- ggplot(print_utility, aes(x=Price, y=log(BuildingArea), color=log(BuildingArea),na.rm = TRUE)) +
+  geom_point(na.rm = TRUE, position = "jitter", alpha=0.3)+
+  labs(title="Building area by price",x="Price", y = "Building area")+
+  scale_x_continuous(guide = guide_axis(check.overlap = TRUE))+
+  scale_y_continuous(guide = guide_axis(check.overlap = TRUE))
+
+
+rgnam <- ggplot(print_utility[1:300,], aes(x=Price, y=Regionname, fill=Regionname,na.rm = TRUE)) +
+  geom_boxplot(outlier.colour="black", outlier.shape=16,
+             outlier.size=2, notch=FALSE)+
+  labs(title="Region by price",x="Price", y = "Region name")+
+  scale_fill_manual(values=c("purple", "lightgreen", "lightblue", "orange","grey"), name = "Region")+
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE))
+
+grid.arrange(lndsz, bldngarea, rgnam)
+```
+
+
+We conclude this series of depictions with the couple of scatter plots of land size and building area in relation to price; and the box plot of the regions.
+
+
+We can start saying that land size and building area are two features very similar, because the first one tells the dimension of the external area of the house, and the second one is referred to the internal dimension of the house, both dimensions expressed in meters. The similarities continues when we take a look on how they behave about the correlation with the price variable. They both have a correlation, the values have also the same ranges: both dimensions alternate to a maximum that does not exceeds the 10000 meters, for a price that does not go over almost 6,000,000 AUD. Clearly we have some outliers.
+
+On the other hand, the box plot shows the presence of some outliers, and different medians for the variables. Nevertheless they are not at the same level, the Norther Metropolitan and the Southern Metropolitan, shares a similar distribution; with a centered median and pretty the same range of price. 
+
+#### Transform non-numerical categorical data into numerical one-hot encoded
+
+Now it's time to encode and standardize the data, before proceeding with the rest of the analysis. We use one-hot encoding 
+```{r}
+# Perform one-hot encoding
+dummy <- dummyVars(~ Suburb + Type + Regionname, data=houses)
+dummie_df <- data.frame(predict(dummy, newdata=houses))
+```
+
+```{r echo=FALSE}
+# Merge all variables in one data frame
+houses_final = cbind(houses[,!(names(houses) %in% c("Suburb","Type","Regionname"))],dummie_df)
+
+# Standardize (scale) data
+houses_final$Rooms = scale(houses_final$Rooms)[,1]
+houses_final$Distance = scale(houses_final$Distance)[,1]
+houses_final$Bathroom = scale(houses_final$Bathroom)[,1]
+houses_final$Car = scale(houses_final$Car)[,1]
+houses_final$Landsize = scale(houses_final$Landsize)[,1]
+houses_final$BuildingArea = scale(houses_final$BuildingArea)[,1]
+```
+
+#### Correlation matrix
+
+
+```{r echo=FALSE}
+# Get correlation 
+houses.cor = cor(houses_final)
+
+# Show heat map of correlation only for 7 variables
+corrplot(houses.cor[1:7,1:7], method = "number")
+
+# Get the variables most correlated to "price"
+corr_price = as.data.frame(as.data.frame(houses.cor))
+corr_price['variable'] = rownames(corr_price)
+corr_price['order'] = abs(corr_price['Price'])
+corr_price = corr_price[order(-corr_price$order),c('variable','Price')]
+```
+
+As we can see in the *Correlogram*, most correlated variables are *Bathroom*, *BuildingArea* and *Rooms*.
+
+To be more specific, we can print a list of the top 10 of the most correlated features to price :
+```{r echo=FALSE}
+corr_price[2:11,][2]
+```
+
+Hence we divide the dataset into two slices = Train (80%) and test (20%), because we are now ready to try a first linear regression model.
+
+```{r echo=FALSE}
+# Split data in train and test
+trainIndex <- createDataPartition(houses_final$Price, p = .8, 
+                                  list = FALSE, 
+                                  times = 1) #just put any column of the dataset to select the correct interval
+
+train <- houses_final[ trainIndex,]
+test  <- houses_final[-trainIndex,]
+
+# Get mean and sd for price to reverse the scaling (standardization)
+mean_price = mean(train$Price)
+sd_price = sd(train$Price)
+
+# Scale price
+train$Price = scale(train$Price)[,1]
+``` 
+
+
+In this problem, the target variable *Price* -> *Y* can be modeled as a *Normal* distribution. 
+
+$Y_i \sim N(\mu, \tau^2)$
+
+
+Here there's the creation of the variables that we will use for the Linear Regression, for our price prediction.
+
+
+
+```{r} 
+n = nrow(train)
+Y = train$Price
+
+Rooms = train$Rooms
+Bathroom = train$Bathroom
+RegionnameSouthern.Metropolitan = train$RegionnameSouthern.Metropolitan
+BuildingArea = train$BuildingArea
+Typeh = train$Typeh
+Typeu = train$Typeu
+Distance = train$Distance
+Landsize = train$Landsize
+Car = train$Car
+```
+
+#### Jags model
+
+Here we create the list for BUGS data. We want to start with a little model, with 3 variables. The reason is that we want to try to obtain a good fit even though we have less variables, hence we have: $Y = \beta_1 \cdot Rooms + \beta_2 \cdot Bathroom + \beta_3 \cdot RegionnameSouthern.Metropolitan$. The variables are freely chosen from the list shown before.
+
+Model coefficients $\beta_i$ are typically defined as Normal because they can assume values between all real numbers, so they can take any value between $-\infty$ and $\infty$.
+
+We want the beta to have a mean of $0$ to be able to check if it is significant or not, and we also want it doesn't have a flat behaviour around the mean, that's why we use a small value for the variance of the betas in the prior distributions.
+
+Or, in other words, we want the values of the betas don’t have a huge variance, because doing so may cause the performance of the final model to not be so good. So, we choose this deviation, to obtain parameters more close to the expected value. Also, the decision is made after a tuning given from some attempt. $\beta_i \sim N(\mu = 0, \sigma^2 = 0.001)$.
+
+Same reasoning is made for the $\tau$, which is a gamma distribution $\tau \sim dgamma(0.5,0.5)$; we choose rate and shape of $r=0.5, s=0.5$ because we select them based on the distribution of the response variable variance. Since the response variable is standardized, then the variance should be around 1.
+
+It is easy to understand, because when we look for mean and variance of a gamma distribution we do $mean(\tau) = \frac{shape}{rate}$ ; $var(\tau)= \frac{shape}{rate^2}$. In our case, we will have that, to have $mean=1$, because of standardization, we will have $mean(\tau)=\frac{0.5}{0.5}=1$. On the other hand our variance will be $var(\tau)=\frac{0.5}{0.5^2}=2$; which is a suitable value considering that the standardized variance usually moves between $-3$ and $+3$.
+
+Why using a gamma distribution? Because $\tau$ is the inverse of the variance, and it is always a positive value. Then, the gamma distribution is often used for that kind of variables.
+
+
+```{r}
+bug1.dat <- list("y" = Y, "N" = n, "x1" = Rooms, "x2" = Bathroom, "x3" = RegionnameSouthern.Metropolitan)
+```
+
+Hence we define the parameters to show after the jags
+```{r}
+mod1.params <- c("intercept", "beta1", "beta2", "beta3", "tau")
+```
+
+```{r}
+# Define model
+#Identify file path of model file
+jags_model_1 <- tempfile()
+
+#Write model to file
+writeLines("
+model {
+  # Likelihood
+  for (i in 1:N){
+    y[i] ~ dnorm(mu[i], tau)
+    mu[i] <-  intercept + beta1*x1[i] + beta2*x2[i] + beta3*x3[i]}
+  
+  ## Defining the prior beta parameters
+  tau ~ dgamma(.5,.5)
+
+  # Define prior for intercept
+  intercept ~ dnorm(0, 0.001)
+
+  # Define prior for beta_n
+  beta1 ~ dnorm(0, 0.001)
+  beta2 ~ dnorm(0, 0.001)
+  beta3 ~ dnorm(0, 0.001)
+  
+}
+", con = jags_model_1)
+```
+And we can see a summary of $\beta_i$ and $\tau^2$ that we got after the simulations.
+```{r echo=FALSE}
+model1 <- jags(data = bug1.dat,
+               n.iter = 10000,
+               model.file = jags_model_1,      
+               n.chains = 3, 
+               parameters.to.save = mod1.params,
+               n.burnin = 1000, n.thin = 10)
+
+kable(model1$BUGSoutput$summary, digits = 3) %>% 
+  kable_styling()
+```
+
+
+We know that $\beta_i$ measures the marginal impact of the $X_i$ on the odds in favor of $Y$. Fixed this concept, we can comment the results obtained.
+
+* *Mean* is the point estimate for $\beta_i$
+* *Sd* is the standard deviation
+* *Rhat* is the potential scale reduction and it is a measure of the convergence of the chain; it is a comparison *between chain variance* and *whithin chain variance*; if they are similar they come from the same distribution. As we can see in our case, this value is very close to 1 for each predicted value
+* *n.eff* is the effective sample size that can be considered as the number of independent Monte Carlo samples necessary to same precision of the MCMC samples. The greater is this value, the lower the autocorrelation between the MCMC steps is, and the better is the final approximation
+* *DIC* is the *Deviance Information Criteria* , which is a generalization of the *AIC* and a measure of goodness of fit. It's good as the value is the lowest possible. These measure it's only important for comparing models, it's not a ranking criteria
+* *deviance* is a measure of goodness of the model fit at different steps of the chain. We want it to be stationary to be able to use it for DIC and understand the goodness of the model
+
+#### Frequentist Approach of Linear Regression Model
+
+```{r echo=FALSE}
+## Frequentist Approach
+glm1 <-lm(Price ~ Rooms + Bathroom + RegionnameSouthern.Metropolitan, data = train)
+
+## Check
+kable(summary(glm1)$coefficients, digits = 3) %>% 
+  kable_styling()
+```
+
+As we can see, our model is very similar to this frequentist approach. What is also similar is the AIC to the Bayesian model analyzed before. So generally we can say that all went good. 
+
+* *DIC* of the model  `r model1$BUGSoutput$DIC`; 
+* *AIC* = `r AIC(glm1)`. 
+
+
+#### MCSE
+
+Now it's time to get the MCSE.
+
+The MCSE measures the inaccuracy of MC samples, which means that a smaller value of MCSE is an indicator of better sampling performance. 
+
+When applying the logarithm of the MCSE what we are doing is changing the scale of the value obtained. Hence, the interpretation will be that the more negative the $log(MCSE)$ is, the better sampling performance each MCMC of the beta has. 
+
+We use the logarithm of MCSE instead of the normal MCSE to have a more visible scale.
+
+```{r echo=FALSE}
+## Compute
+n <- length(colnames(model1$BUGSoutput$sims.matrix))
+mcse_df <- data.frame(MCSE = rep(NA, n))
+
+rownames(mcse_df) <-
+  colnames(model1$BUGSoutput$sims.matrix)[1:n] 
+
+## Cycle
+for(colname in colnames(model1$BUGSoutput$sims.matrix)[1:n]){
+  mcse_df[colname,"MCSE"]<-
+    LaplacesDemon::MCSE(model1$BUGSoutput$sims.matrix[,colname])
+}
+
+## Check
+kable(mcse_df, col.names = "MCSE") %>% 
+  kable_styling()
+```
+
+```{r echo=FALSE}
+appoggio = mcse_df$MCSE
+appoggio = data.frame(appoggio)
+colnames(appoggio) <- c("MCSE")
+rownames(appoggio) <- c("Intercept", "beta1", "beta2", "beta3", "Deviance", "tau") 
+#barplot(log(mcse_df$MCSE),col = c("lightblue"), main="Plot Log transform MCSE", names = c("B1", "B2", "B3", "D", "T"), horiz = TRUE)
+ggplot(log(appoggio), aes(x=rownames(log(appoggio)), MCSE, fill=rownames(log(appoggio)))) + 
+  geom_bar(stat='identity', fill = c("brown", "purple", "lightgreen", "lightblue", "orange","grey"))+
+  geom_text(aes(label=MCSE), position=position_stack(vjust = .4),  size = 4)+
+  labs(title="MCSE",x="Predicted parameters", y = "Value")+
+  coord_flip()
+  
+```
+
+
+Taking a look at the *Bar plot* of the Log Transform of the Sample Error, we can understand that $\beta_1$ has the best performance sampling, since is the smallest value, and it is followed by $\beta_2$. On the other hand, $\beta_3$'s value is really too big. Since this fact, that means that that one is not a good approximation, and we have to take in consideration also this element.
+
+#### Posterior Uncertainty
+
+Here we compute the posterior uncertainty, using the formula $\frac{sd(x)}{|mean(x)|}$
+
+```{r echo=FALSE}
+## Extract mean and sd
+post_un <- as.data.frame(model1$BUGSoutput$summary[,c("mean","sd")])
+
+## Adding Estimation of uncertainty
+post_un$variability <- apply(post_un, 1, function(x){
+  return(x["sd"]/abs(x["mean"]))
+})
+
+## Check
+kable(post_un,
+      col.names = c("Mean", "Sd", "Uncertainty")) %>% 
+        kable_styling()
+```
+
+As we can see in the table, $\beta_2$ is the parameter which contains more uncertainty.
+
+#### Diagnostics
+
+```{r echo=FALSE}
+## Get chains
+chainArray <- model1$BUGSoutput$sims.array
+mcmc_mod   <- as.mcmc(model1)
+```
+
+##### $\beta_i$  Trace, Density, Autocorrelation Plots
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 1 Plot
+beta_1_df <- data.frame(beta_1 = chainArray[,1,"beta1"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_1_df,aes(index, beta_1)) +
+  geom_line(color = "yellow") +
+  xlab("Iteration") +
+  ylab(expression(beta[1])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[1]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_1_df, aes(beta_1)) +
+  geom_density(col = "yellow",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[1]))+
+  ggtitle(expression(paste("Density plot of ", beta[1])))
+
+## Autocorrelation
+b1_acf    <- acf(chainArray[,1,"beta1"], plot = FALSE)
+b1_acf_df <- with(b1_acf, data.frame(lag, acf))
+plt <- ggplot(data = b1_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "yellow",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[1])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 2 Plot
+beta_2_df <- data.frame(beta_2 = chainArray[,1,"beta2"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_2_df,aes(index, beta_2)) +
+  geom_line(color = "orange") +
+  xlab("Iteration") +
+  ylab(expression(beta[2])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[2]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_2_df, aes(beta_2)) +
+  geom_density(col = "orange",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[2]))+
+  ggtitle(expression(paste("Density plot of ", beta[2])))
+
+## Autocorrelation
+b2_acf    <- acf(chainArray[,1,"beta2"], plot = FALSE)
+b2_acf_df <- with(b2_acf, data.frame(lag, acf))
+plt <- ggplot(data = b2_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "orange",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[2])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 3 Plot
+beta_3_df <- data.frame(beta_3 = chainArray[,1,"beta3"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_3_df,aes(index, beta_3)) +
+  geom_line(color = "red") +
+  xlab("Iteration") +
+  ylab(expression(beta[3])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[3]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_3_df, aes(beta_3)) +
+  geom_density(col = "red",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[3]))+
+  ggtitle(expression(paste("Density plot of ", beta[3])))
+
+## Autocorrelation
+b3_acf    <- acf(chainArray[,1,"beta3"], plot = FALSE)
+b3_acf_df <- with(b3_acf, data.frame(lag, acf))
+plt <- ggplot(data = b3_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "red",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[3])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+The depictions above are really clear around the fact that the model has symptoms of good convergence, as we can especially see in the autocorrelation plot, it goes to $0$ almost instantly.
+
+##### Gelman Plot
+
+```{r echo=FALSE}
+## Check
+gelman_diag <- gelman.diag(mcmc_mod)
+kable(gelman_diag$psrf) %>% 
+  kable_styling()
+```
+
+We can see that all the values are near 1, this information tells us that the iterations are enough for stationary distributions.
+
+```{r echo=FALSE, fig.dim=c(10, 8)}
+## Plot
+gelman.plot(mcmc_mod)
+```
+
+Also here in the Gelman Plot, the median is under the acecptance curve for most of the time, so we can accept that.
+
+##### Geweke-Brooks plot
+
+The **Geweke diagnostics ** is based on a test for equality of the means of the first and last part of a Markov chain. The test statistic is a standard Z-score: the difference between the two sample means divided by its estimated standard error adjusted for autocorrelation.
+
+```{r echo=FALSE}
+## Test
+gew_diag    <- geweke.diag(mcmc_mod)
+gew_diag_df <- cbind(gew_diag[[1]]$z,
+                     gew_diag[[2]]$z,
+                     gew_diag[[3]]$z)
+colnames(gew_diag_df) <- c("Z-score chain 1",
+                           "Z-score chain 2",
+                           "Z-score chain 3")
+## Check
+kable(gew_diag_df) %>%
+  kable_styling()
+```
+```{r echo=FALSE, fig.align="center", fig.height=10, fig.width=10, warning=FALSE}
+## Plot
+geweke.plot(mcmc_mod[[1]])
+```
+
+As we can see, the majority of the values are inside the acceptance area so we almost always accept the equality of the means.
+
+#### Credible Intervals, Point estimates and HPD of $\beta_i$
+
+Given the fact that in the *Diagnostics Section* we noticed that our simulations went in the correct way for convergence, we can compute credible intervals and point estimates of our $\beta_i$ values that we estimated.
+
+```{r echo=FALSE}
+## Extract Matrix
+chainMat <- model1$BUGSoutput$sims.matrix
+
+## Point estimates
+beta_hat_jags <- colMeans(chainMat)
+ 
+## Credible Interval
+chain_matrix <- subset(model1$BUGSoutput$sims.matrix,
+                       select = -deviance)
+cred      <- 0.95
+p.ET.jags <- apply(chain_matrix, 2, quantile,
+                   prob = c((1-cred)/2, 1-(1-cred)/2))
+## HDP
+p.HPD.jags <- HPDinterval(as.mcmc(chain_matrix))
+```
+
+##### Point Estimates
+
+```{r echo=FALSE}
+## Point Estimates
+kable(beta_hat_jags, col.names = "Point Estimates") %>% 
+  kable_styling()
+```
+
+
+Here we have a table of the estimates, which includes the intercept and the deviance.Deviance is a goodness-of-fit metric for statistical models, can be thought as how much variation in the data does our Proposed Model account for. Therefore, the lower the deviance, the better the model.
+
+##### Credible Intervals: Equal Tailed Interval (ETI)
+An equal-tailed interval (also called a central interval) of confidence level $\alpha$ is an interval 
+
+$I_{\alpha}=[q_{\alpha/2},q_{1- \alpha/2}]$
+
+where $q_z$ is a quantile of the posterior distribution. In our case we are talking about a 95% equal-tailed interval. $I_{0.05} = [q_{0.025},q_{0.975}]$; where $q_{0.025}$ and $q_{0.975}$ are the quantiles of the posterior distribution. This is an interval on whose both right and left side lies 2.5% of the probability mass of the posterior distribution; hence the name *equal-tailed interval*.
+
+```{r echo=FALSE}
+## Check
+## Odds
+t(p.ET.jags) %>%
+  kable(caption = "Odds") %>%
+  kable_styling()
+```
+
+Here we see that the value closest to 0 is the $\beta_2$, which influences the *Bathroom* feature. This means that the posterior parameter has a role in the variability of the prediction, but is a relatively low role. We remember that in Bayesian Credible Intervals, the interpretation of the 95% confidenec level (which is known as credible interval): there is a 95% probability that the true (unknown) estimate would lie within the interval, given the evidence provided by the observed data.
+
+##### Highest Posterior Density
+
+We also remember that in Bayesian Statistics there are also *High Posterior Density* intervals, A highest posterior density (HPD) region of confidence level$\alpha$ is a $1-\alpha$ confidence region  $I_{\alpha}$ for which holds that the posterior density for every point in this set is higher than the posterior density for any point outside of this set: $f_{\Theta|Y}(\theta|y) \geq f_{\Theta|Y}(\theta'|y)$ HPD region is not necessarily an interval, this means that HPD regions are not necessarily always strictly credible intervals.
+```{r echo=FALSE}
+## Check
+## Odds
+p.HPD.jags %>%
+  kable(caption = "Odds") %>%
+  kable_styling()
+```
+
+#### Second Jags Model
+```{r echo=FALSE}
+n = nrow(train)
+Y = train$Price
+
+Rooms = train$Rooms
+Bathroom = train$Bathroom
+RegionnameSouthern.Metropolitan = train$RegionnameSouthern.Metropolitan
+BuildingArea = train$BuildingArea
+Typeh = train$Typeh
+Typeu = train$Typeu
+Distance = train$Distance
+Landsize = train$Landsize
+Car = train$Car
+```
+
+Now we put the top features more correlated to price inside, to see what difference we obtain comparing to the feature selection model studied before.
+
+Here we have :
+
+$Y = \beta_1 \cdot Rooms + \beta_2 \cdot Bathroom + \beta_3 \cdot RegionnameSouthern.Metropolitan + \beta_4 \cdot BuildingArea + \beta_5 \cdot Typeh + \beta_6 \cdot Typeu + \beta_7 \cdot Distance + \beta_8 \cdot Landsize + \beta_9 \cdot Car$.
+
+```{r}
+bug2.dat <- list("y" = Y, "N" = n, "x1" = Rooms, "x2" = Bathroom, "x3" = RegionnameSouthern.Metropolitan, "x4" = BuildingArea, "x5" = Typeh, "x6" = Typeu, "x7" = Distance, "x8" = Landsize, "x9" = Car)
+``` 
+
+Again, we select the results we want to show
+
+```{r define-posterior-params}
+mod2.params <- c("intercept", "beta1", "beta2", "beta3", "beta4","beta5", "beta6", "beta7", "beta8", "beta9", "tau")
+```
+
+Consequently, we run the second Jags model, using the Bayesian approach.
+
+```{r}
+# Define model
+#Identify file path of model file
+jags_model_2 <- tempfile()
+
+#Write model to file
+writeLines("
+model {
+  # Likelihood
+  for (i in 1:N){
+    y[i] ~ dnorm(mu[i], tau)
+    mu[i] <-  intercept + beta1*x1[i] + beta2*x2[i] +
+      beta3*x3[i] + beta4*x4[i] + beta5*x5[i] +
+      beta6*x6[i] + beta7*x7[i] + beta8*x8[i] + beta9*x9[i]}
+
+  ## Defining the prior beta parameters
+  tau ~ dgamma(.5,.5)
+
+  # Define prior for intercept
+  intercept ~ dnorm(0, 0.01)
+
+  # Define prior for beta_n
+  beta1 ~ dnorm(0, 0.001)
+  beta2 ~ dnorm(0, 0.001)
+  beta3 ~ dnorm(0, 0.001)
+  beta4 ~ dnorm(0, 0.001)
+  beta5 ~ dnorm(0, 0.001)
+  beta6 ~ dnorm(0, 0.001)
+  beta7 ~ dnorm(0, 0.001)
+  beta8 ~ dnorm(0, 0.001)
+  beta9 ~ dnorm(0, 0.001)
+}
+", con = jags_model_2)
+```
+
+And we can see the summary
+
+```{r echo=FALSE}
+model2 <- jags(data = bug2.dat,
+               # n.iter = 10000,
+               #n.iter = 100000,
+               n.iter = 50000,
+               model.file = jags_model_2,      
+               n.chains = 3, 
+               parameters.to.save = mod2.params,
+               # n.burnin = 1000, n.thin = 10)
+               #n.burnin = 10000, n.thin = 10)
+               n.burnin = 5000, n.thin = 10)
+
+kable(model2$BUGSoutput$summary, digits = 3) %>% 
+  kable_styling()
+```
+
+
+
+
+#### Frequentist Approach Second Linear Regression Model
+
+```{r echo=FALSE}
+## Frequentist Approach
+glm2 <- lm(Price ~ Rooms + Bathroom + RegionnameSouthern.Metropolitan + BuildingArea + Typeh + Typeu + Distance + Landsize + Car, data = train)
+
+
+## Check
+kable(summary(glm2)$coefficients, digits = 3) %>% 
+  kable_styling()
+```
+
+Also here, like in the model before, values are pretty similar between Bayesian and frequentist approach.
+
+* *DIC* of the model  `r model2$BUGSoutput$DIC`;
+* *AIC* = `r AIC(glm2)`
+
+
+#### MCSE
+
+Now it's time to get the MCSE
+
+```{r echo=FALSE}
+## Compute
+n <- length(colnames(model2$BUGSoutput$sims.matrix))
+mcse_df <- data.frame(MCSE = rep(NA, n))
+
+rownames(mcse_df) <-
+  colnames(model2$BUGSoutput$sims.matrix)[1:n] 
+
+## Cycle
+for(colname in colnames(model2$BUGSoutput$sims.matrix)[1:n]){
+  mcse_df[colname,"MCSE"]<-
+    LaplacesDemon::MCSE(model2$BUGSoutput$sims.matrix[,colname])
+}
+
+## Check
+kable(mcse_df, col.names = "MCSE") %>% 
+  kable_styling()
+```
+
+```{r echo=FALSE}
+appoggio = mcse_df$MCSE
+appoggio = data.frame(appoggio)
+colnames(appoggio) <- c("MCSE")
+rownames(appoggio) <- c("Intercept", "beta1", "beta2", "beta3", "beta4", "beta5", "beta6", "beta7", "beta8", "beta9", "Deviance", "tau")
+#barplot(log(mcse_df$MCSE),col = c("lightblue"), main="Plot Log transform MCSE", names = c("B1", "B2", "B3", "D", "T"), horiz = TRUE)
+ggplot(log(appoggio), aes(x=rownames(log(appoggio)), MCSE, fill=rownames(log(appoggio)))) + 
+  geom_bar(stat='identity', fill = c("brown", "purple", "lightgreen", "lightblue", "orange","grey", "red", "orchid", "darkgreen", "blue", "green", "violet"))+
+  labs(title="MCSE",x="Predicted parameters", y = "Value")+
+  geom_text(aes(label=MCSE), position=position_stack(vjust = .4),  size = 4)+
+  labs(title="MCSE",x="Predicted parameters", y = "Value")+
+  coord_flip()
+```
+
+
+Taking a look at the Log Transform of the Sample Error, we can understand that $\beta_6$, $\beta_8$ and $\beta_7$ have the best performance sampling, since, respectively, they have the smallest values.
+
+#### Posterior Uncertainty
+
+```{r echo=FALSE}
+## Extract mean and sd
+post_un <- as.data.frame(model2$BUGSoutput$summary[,c("mean","sd")])
+
+## Adding Estimation of uncertainty
+post_un$variability <- apply(post_un, 1, function(x){
+  return(x["sd"]/abs(x["mean"]))
+})
+
+## Check
+kable(post_un,
+      col.names = c("Mean", "Sd", "Uncertainty")) %>% 
+        kable_styling()
+```
+
+As we can see in the table above, $\beta_9$ is the parameter which contains more uncertainty, followed by $\beta_4$.
+
+#### Diagnostics
+
+```{r echo=FALSE}
+## Get chains
+chainArray <- model2$BUGSoutput$sims.array
+mcmc_mod   <- as.mcmc(model2)
+```
+
+##### $\beta_i$  Trace, Density, Autocorrelation Plots
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 1 Plot
+beta_1_df <- data.frame(beta_1 = chainArray[,1,"beta1"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_1_df,aes(index, beta_1)) +
+  geom_line(color = "yellow") +
+  xlab("Iteration") +
+  ylab(expression(beta[1])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[1]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_1_df, aes(beta_1)) +
+  geom_density(col = "yellow",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[1]))+
+  ggtitle(expression(paste("Density plot of ", beta[1])))
+
+## Autocorrelation
+b1_acf    <- acf(chainArray[,1,"beta1"], plot = FALSE)
+b1_acf_df <- with(b1_acf, data.frame(lag, acf))
+plt <- ggplot(data = b1_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "yellow",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[1])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 2 Plot
+beta_2_df <- data.frame(beta_2 = chainArray[,1,"beta2"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_2_df,aes(index, beta_2)) +
+  geom_line(color = "orange") +
+  xlab("Iteration") +
+  ylab(expression(beta[2])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[2]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_2_df, aes(beta_2)) +
+  geom_density(col = "orange",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[2]))+
+  ggtitle(expression(paste("Density plot of ", beta[2])))
+
+## Autocorrelation
+b2_acf    <- acf(chainArray[,1,"beta2"], plot = FALSE)
+b2_acf_df <- with(b2_acf, data.frame(lag, acf))
+plt <- ggplot(data = b2_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "orange",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[2])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 3 Plot
+beta_3_df <- data.frame(beta_3 = chainArray[,1,"beta3"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_3_df,aes(index, beta_3)) +
+  geom_line(color = "red") +
+  xlab("Iteration") +
+  ylab(expression(beta[3])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[3]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_3_df, aes(beta_3)) +
+  geom_density(col = "red",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[3]))+
+  ggtitle(expression(paste("Density plot of ", beta[3])))
+
+## Autocorrelation
+b3_acf    <- acf(chainArray[,1,"beta3"], plot = FALSE)
+b3_acf_df <- with(b3_acf, data.frame(lag, acf))
+plt <- ggplot(data = b3_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "red",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[3])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 4 Plot
+beta_4_df <- data.frame(beta_4 = chainArray[,1,"beta4"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_4_df,aes(index, beta_4)) +
+  geom_line(color = "purple") +
+  xlab("Iteration") +
+  ylab(expression(beta[4])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[4]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_4_df, aes(beta_4)) +
+  geom_density(col = "purple",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[4]))+
+  ggtitle(expression(paste("Density plot of ", beta[4])))
+
+## Autocorrelation
+b4_acf    <- acf(chainArray[,1,"beta4"], plot = FALSE)
+b4_acf_df <- with(b4_acf, data.frame(lag, acf))
+plt <- ggplot(data = b4_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "purple",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[4])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 5 Plot
+beta_5_df <- data.frame(beta_5 = chainArray[,1,"beta5"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_5_df,aes(index, beta_5)) +
+  geom_line(color = "violet") +
+  xlab("Iteration") +
+  ylab(expression(beta[5])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[5]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_5_df, aes(beta_5)) +
+  geom_density(col = "violet",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[5]))+
+  ggtitle(expression(paste("Density plot of ", beta[5])))
+
+## Autocorrelation
+b5_acf    <- acf(chainArray[,1,"beta5"], plot = FALSE)
+b5_acf_df <- with(b5_acf, data.frame(lag, acf))
+plt <- ggplot(data = b5_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "violet",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[5])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 6 Plot
+beta_6_df <- data.frame(beta_6 = chainArray[,1,"beta6"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_6_df,aes(index, beta_6)) +
+  geom_line(color = "cyan") +
+  xlab("Iteration") +
+  ylab(expression(beta[6])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[6]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_6_df, aes(beta_6)) +
+  geom_density(col = "cyan",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[6]))+
+  ggtitle(expression(paste("Density plot of ", beta[6])))
+
+## Autocorrelation
+b6_acf    <- acf(chainArray[,1,"beta6"], plot = FALSE)
+b6_acf_df <- with(b6_acf, data.frame(lag, acf))
+plt <- ggplot(data = b6_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "cyan",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[6])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 7 Plot
+beta_7_df <- data.frame(beta_7 = chainArray[,1,"beta7"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_7_df,aes(index, beta_7)) +
+  geom_line(color = "lightblue") +
+  xlab("Iteration") +
+  ylab(expression(beta[7])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[7]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_7_df, aes(beta_7)) +
+  geom_density(col = "lightblue",
+               fill = "blue",
+               alpha = 0.4)+
+  xlab(expression(beta[7]))+
+  ggtitle(expression(paste("Density plot of ", beta[7])))
+
+## Autocorrelation
+b7_acf    <- acf(chainArray[,1,"beta7"], plot = FALSE)
+b7_acf_df <- with(b7_acf, data.frame(lag, acf))
+plt <- ggplot(data = b7_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "lightblue",
+           fill = "blue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[7])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 8 Plot
+beta_8_df <- data.frame(beta_8 = chainArray[,1,"beta8"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_8_df,aes(index, beta_8)) +
+  geom_line(color = "lightgreen") +
+  xlab("Iteration") +
+  ylab(expression(beta[8])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[8]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_8_df, aes(beta_8)) +
+  geom_density(col = "lightgreen",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[8]))+
+  ggtitle(expression(paste("Density plot of ", beta[8])))
+
+## Autocorrelation
+b8_acf    <- acf(chainArray[,1,"beta8"], plot = FALSE)
+b8_acf_df <- with(b8_acf, data.frame(lag, acf))
+plt <- ggplot(data = b8_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "lightgreen",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[8])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+```{r echo=FALSE, fig.align="center", fig.height=2, fig.width=12}
+## Beta 9 Plot
+beta_9_df <- data.frame(beta_9 = chainArray[,1,"beta9"],
+                        index = 1:900)
+## Trace Plot
+tra <-ggplot(data = beta_9_df,aes(index, beta_9)) +
+  geom_line(color = "green") +
+  xlab("Iteration") +
+  ylab(expression(beta[9])) +
+  ggtitle(expression(paste("Trace-plot of ", beta[9]))) +
+  theme(plot.title.position = 'plot', 
+      plot.title = element_text(hjust = 0.5))
+
+## Density
+den <-ggplot(beta_9_df, aes(beta_9)) +
+  geom_density(col = "green",
+               fill = "lightblue",
+               alpha = 0.4)+
+  xlab(expression(beta[9]))+
+  ggtitle(expression(paste("Density plot of ", beta[9])))
+
+## Autocorrelation
+b9_acf    <- acf(chainArray[,1,"beta9"], plot = FALSE)
+b9_acf_df <- with(b9_acf, data.frame(lag, acf))
+plt <- ggplot(data = b9_acf_df,
+              mapping = aes(x = lag, y = acf)) +
+  geom_bar(stat = "identity", position = "identity",
+           col = "green",
+           fill = "lightblue") +
+  ggtitle(expression(paste("Autocorrelation plot of ",beta[9])))
+
+## Check
+grid.arrange(tra, den, plt, ncol = 3)
+```
+
+Also in this second model the parameters goes to 0 after a minimum number of lags; and they also have, as the previous model, one peak in the density plot, so they are all *Unimodal distributions*.
+
+##### Gelman Plot
+
+```{r echo=FALSE}
+## Check
+gelman_diag <- gelman.diag(mcmc_mod)
+kable(gelman_diag$psrf) %>% 
+  kable_styling()
+```
+
+We can see that all the values are near 1, this information tells us that the iterations are enough for stationary distributions.
+
+```{r echo=FALSE, fig.dim=c(10, 8)}
+## Plot
+gelman.plot(mcmc_mod)
+```
+
+Here is doing good, the median is always under the acceptance area.
+
+##### Geweke-Brooks plot
+
+The **Geweke diagnostics ** is based on a test for equality of the means of the first and last part of a Markov chain. The test statistic is a standard Z-score: the difference between the two sample means divided by its estimated standard error adjusted for autocorrelation.
+
+```{r echo=FALSE}
+## Test
+gew_diag    <- geweke.diag(mcmc_mod)
+gew_diag_df <- cbind(gew_diag[[1]]$z,
+                     gew_diag[[2]]$z,
+                     gew_diag[[3]]$z)
+colnames(gew_diag_df) <- c("Z-score chain 1",
+                           "Z-score chain 2",
+                           "Z-score chain 3")
+## Check
+kable(gew_diag_df) %>%
+  kable_styling()
+```
+```{r echo=FALSE, fig.align="center", fig.height=10, fig.width=10, warning=FALSE}
+## Plot
+geweke.plot(mcmc_mod[[1]])
+```
+
+As we can see, the majority of the values are inside the acceptance area, consequently, also here we accept the equality of the means.
+
+#### Credible Intervals, Point estimates and HPD of $\beta_i$
+
+Given the fact that in the *Diagnostics Section* we noticed that our simulations went in the correct way for convergence, we can compute credible intervals and point estimates of our $\beta_i$ values that we estimated.
+
+```{r echo=FALSE}
+## Extract Matrix
+chainMat <- model2$BUGSoutput$sims.matrix
+
+## Point estimates
+beta_hat_jags <- colMeans(chainMat)
+ 
+## Credible Interval
+chain_matrix <- subset(model2$BUGSoutput$sims.matrix,
+                       select = -deviance)
+cred      <- 0.95
+p.ET.jags <- apply(chain_matrix, 2, quantile,
+                   prob = c((1-cred)/2, 1-(1-cred)/2))
+## HDP
+p.HPD.jags <- HPDinterval(as.mcmc(chain_matrix))
+```
+
+##### Point Estimates
+
+```{r echo=FALSE}
+## Point Estimates
+kable(beta_hat_jags, col.names = "Point Estimates") %>% 
+  kable_styling()
+```
+
+Above we have the point estimates.
+
+
+##### Credible Intervals: Equal Tailed Interval (ETI)
+
+```{r echo=FALSE}
+## Check
+## Odds
+t(p.ET.jags) %>%
+  kable(caption = "Odds") %>%
+  kable_styling()
+```
+
+From what we see here, there is a posterior parameter, $\beta_4$, which influences the *BuildingArea* feature; that is the lowest one, very close to zero. So is the parameter that influences less in this case, even though the value is not zero. Or as we said before, this means that the posterior parameter has a role in the variability of the prediction, but is a relatively low role. 
+
+##### Highest Posterior Density
+
+```{r echo=FALSE}
+## Check
+## Odds
+p.HPD.jags %>%
+  kable(caption = "Odds") %>%
+  kable_styling()
+```
+
+Also for this model we see the *HPD* interval.
+
+#### Model comparison
+
+We now compare the models using the DIC (Deviance Information Criterion), that is defined as follows:
+
+$DIC = D(\hat\theta) - 2 \, p_D$, where $D(\hat\theta) = -2 \, log\,  f(y|\theta)$ is the deviance of the model, and $p_D$ is the number of effective ("unconstrained") parameters in the model.
+
+```{r echo=FALSE}
+## Bayesian Approach
+kable(rbind("Model 1 (reduced)" = model1$BUGSoutput$DIC,
+            "Model 2 (complete)" = model2$BUGSoutput$DIC),
+      col.names = "DIC", caption = "Bayesian Approach") %>% 
+  kable_styling()
+```
+
+The model with the *best DIC* is the second one (full features one). So the rest of our analysis will be based on the second model.
+
+#### Evaluating Regression Model
+
+We define the test variables coming from the test set
+
+```{r} 
+N = nrow(test)
+Yt = test$Price
+
+
+Rooms = test$Rooms
+Bathroom = test$Bathroom
+RegionnameSouthern.Metropolitan = test$RegionnameSouthern.Metropolitan
+BuildingArea = test$BuildingArea
+Typeh = test$Typeh
+Typeu = test$Typeu
+Distance = test$Distance
+Landsize = test$Landsize
+Car = test$Car
+```
+
+
+And now we compute the parameters for our prediction. To do so, we use the knowings obtained from the following source: https://bayesball.github.io/BOOK/bayesian-multiple-regression-and-logistic-models.html [12.2.4 Prediction], where it is clearly explained how to make predictions having regression models. 
+
+We notice that our $sd = \sqrt{\frac{1}{\tau}}$, since we define $\tau$ as $\tau = \frac{1}{sd^2}$
+
+
+
+```{r } 
+sim = colMeans(model2$BUGSoutput$sims.array)
+
+# Initialize vector to store the prediction for all the examples of test set
+final_predictions = c()
+
+# Loop over each example of test set
+for (i in 1:N){
+  intercept = mean(sim[, "intercept"])
+  beta1 = mean(sim[, "beta1"])
+  beta2 = mean(sim[, "beta2"])
+  beta3 = mean(sim[, "beta3"])
+  beta4 = mean(sim[, "beta4"])
+  beta5 = mean(sim[, "beta5"])
+  beta6 = mean(sim[, "beta6"])
+  beta7 = mean(sim[, "beta7"])
+  beta8 = mean(sim[, "beta8"])
+  beta9 = mean(sim[, "beta9"])
+  
+  pred_mean = intercept + beta1 * Rooms[i] + beta2 * Bathroom[i] + beta3 * RegionnameSouthern.Metropolitan[i] +
+    beta4 * BuildingArea[i] + beta5 * Typeh[i] + beta6 * Typeu[i] + beta7 * Distance[i] +
+    beta8 * Landsize[i] + beta9 * Car[i]
+  
+  set.seed(0)
+  pred <- mean(rnorm(5000, mean=pred_mean, sd= sqrt(1 / mean(sim[, "tau"]))))
+        
+  # Reverse  standardization
+  pred = (pred * sd_price) + mean_price
+  
+  # Append final predictions
+  final_predictions = append(final_predictions, pred)
+}
+```
+
+ 
+```{r echo=FALSE}
+# FUnction to calculate R-squared
+rsq <- function (x, y) cor(x, y) ^ 2
+```
+
+```{r echo=FALSE}
+# Fitting frequentist model 2
+#summary(glm2)
+# Prediction with frequentist mode
+prediction_frequetist <- predict(glm2, newdata = test)
+```
+
+
+
+We cannot calculate the accuracy for a regression model, because accuracy it's a measure to evaluate how accurate it's a classification, just for example. The skill, or performance, of a regression model must be reported as an error in those predictions.
+
+If we have to predict numeric values, as a dollar amount, just like in our case; we don't want to know if the model predicted the value exactly, instead we want to know how close the predictions were to the expected values. Error addresses this and summarizes on average how close the predictions were to their expected values. 
+
+There are three common evaluation metrics for evaluating a Linear Regression model:
+
+* Mean Squared Error(MSE) -> $MSE = \frac{1}{n}\sum^{n}_{i=1}(Y_i-\hat{Y_i})^2$
+* Root Mean Squared error (RMSE) -> $RMSE = \sqrt{\frac{\sum^{n}_{i=1}(Y_i-\hat{Y_i})^2}{n}}$
+* Mean Absolute Error (MAE) -> $MAE = \frac{1}{n}\sum^{n}_{i=1}|Y_i-\hat{Y_i}|$
+* R-Squared (RSQ) ->  $RSQ = Cor(x,y)^2$; it is the squared correlation between truth and estimate. Defined between $(0,1)$, the more is closer to $1$, the better are the predictions.
+
+Hence, we have the following metrics for Bayesian predictions.
+
+*MSE* = `r mse(Yt, final_predictions)`
+
+*RMSE* = `r rmse(Yt, final_predictions)`
+
+*MAE* = `r mae(Yt, final_predictions)`
+
+*RSQ* = `r rsq(Yt, final_predictions)`
+
+We can also see predictions from the frequentist model.
+
+*MSE* = `r mse(Yt, prediction_frequetist)`
+
+*RMSE* = `r rmse(Yt, prediction_frequetist)`
+
+*MAE* = `r mae(Yt, prediction_frequetist)`
+
+*RSQ* = `r rsq(Yt, prediction_frequetist)`
+
+We can take a look also at the predictions of the first model, to see the differences.
+
+```{r echo=FALSE} 
+#first model prediction performance
+sim = colMeans(model1$BUGSoutput$sims.array)
+
+# Initialize vector to store the prediction for all the examples of test set
+final_predictions_2 = c()
+
+# Loop over each example of test set
+for (i in 1:N){
+  intercept = mean(sim[, "intercept"])
+  beta1 = mean(sim[, "beta1"])
+  beta2 = mean(sim[, "beta2"])
+  beta3 = mean(sim[, "beta3"])
+  
+  pred_mean = intercept + beta1 * Rooms[i] + beta2 * Bathroom[i] + beta3 * RegionnameSouthern.Metropolitan[i]
+  
+  set.seed(0)
+  pred <- mean(rnorm(1000, mean=pred_mean, sd= sqrt(1 / mean(sim[, "tau"]))))
+        
+  # Reverse  standardization
+  pred = (pred * sd_price) + mean_price
+  
+  # Append final predictions
+  final_predictions_2 = append(final_predictions_2, pred)
+}
+```
+
+
+
+```{r echo=FALSE}
+# Fitting frequentist model 1
+
+# Prediction with frequentist mode
+prediction_frequetist_2 <- predict(glm1, newdata = test)
+
+```
+
+Bayesian predictions:
+
+*MSE* = `r mse(Yt, final_predictions_2)`
+
+*RMSE* = `r rmse(Yt, final_predictions_2)`
+
+*MAE* = `r mae(Yt, final_predictions_2)`
+
+*RSQ* = `r rsq(Yt, final_predictions_2)`
+
+Frequentist predictions:
+
+*MSE* = `r mse(Yt, prediction_frequetist_2)`
+
+*RMSE* = `r rmse(Yt, prediction_frequetist_2)`
+
+*MAE* = `r mae(Yt, prediction_frequetist_2)`
+
+*RSQ* = `r rsq(Yt, prediction_frequetist_2)`
+
+
+#### Conclusions
+
+We have concluded this full Bayesian analysis. We obtained a good prediction model, which after all this analysis, we understood was the second one. We also compared the two models by means of DIC, MSE, RMSE, MAE and RSQ. All metrics that we can find in the final table to sum up.
+
+
+
+```{r echo=FALSE}
+kable(rbind("Model 1 (reduced)" = c(model1$BUGSoutput$DIC,AIC(glm1),mse(Yt, final_predictions_2),rmse(Yt, final_predictions_2),
+                                   mae(Yt, prediction_frequetist_2),rsq(Yt, prediction_frequetist_2)),
+            "Model 2 (complete)" = c(model2$BUGSoutput$DIC,AIC(glm2),mse(Yt, final_predictions),rmse(Yt, final_predictions),
+                                   mae(Yt, prediction_frequetist),rsq(Yt, prediction_frequetist))),
+      col.names = c("DIC","AIC","MSE","RMSE","MAE","RSQ"), caption = "Comparison table") %>% 
+  kable_styling()
+```
+
+
+What we can say is that, even if sometimes a model with a large number of features could lead to overfitting, there are some cases, like our specific one, in which we can obtain a better model using all the correlated features. 
+
